@@ -13,6 +13,7 @@ from collections import defaultdict
 from pathlib import Path
 from pydoc import locate
 
+import matplotlib
 import numpy as np
 import torch
 from omegaconf import OmegaConf
@@ -36,6 +37,8 @@ from .utils.tools import (
     fork_rng,
     set_seed,
 )
+
+matplotlib.use('Agg')
 
 # @TODO: Fix pbar pollution in logs
 # @TODO: add plotting during evaluation
@@ -87,7 +90,7 @@ def do_evaluation(model, loader, device, loss_fn, conf, pbar=True):
         n, plot_fn = conf.plot
         plot_ids = np.random.choice(len(loader), min(len(loader), n), replace=False)
     for i, data in enumerate(
-        tqdm(loader, desc="Evaluation", ascii=True, disable=not pbar)
+            tqdm(loader, desc="Evaluation", ascii=True, disable=not pbar)
     ):
         data = batch_to_device(data, device, non_blocking=True)
         with torch.no_grad():
@@ -255,7 +258,7 @@ def training(rank, conf, output_dir, args):
         device = "cuda" if torch.cuda.is_available() else "cpu"
     logger.info(f"Using device {device}")
 
-    dataset = get_dataset(data_conf.name)(data_conf)
+    dataset = get_dataset(data_conf.name)(data_conf, modality_list=args.modality_list)
 
     # Optionally load a different validation dataset than the training one
     val_data_conf = conf.get("data_val", None)
@@ -289,7 +292,19 @@ def training(rank, conf, output_dir, args):
 
     stop = False
     signal.signal(signal.SIGINT, sigint_handler)
-    model = get_model(conf.model.name)(conf.model).to(device)
+    model = get_model(conf.model.name)(conf.model)
+    if args.ckpt_path is not None:
+        logger.info(f"Loading model from {args.ckpt_path}")
+        state_dict = torch.load(args.ckpt_path, map_location="cpu")
+        for i in range(9):
+            pattern = f"self_attn.{i}", f"transformers.{i}.self_attn"
+            state_dict = {k.replace(*pattern): v for k, v in state_dict.items()}
+            pattern = f"cross_attn.{i}", f"transformers.{i}.cross_attn"
+            state_dict = {k.replace(*pattern): v for k, v in state_dict.items()}
+        # for key in state_dict.keys():
+        #     print(key)
+        model.matcher.load_state_dict(state_dict, strict=False)
+    model.to(device)
     if args.compile:
         model = torch.compile(model, mode=args.compile)
     loss_fn = model.loss
@@ -305,6 +320,8 @@ def training(rank, conf, output_dir, args):
     if args.detect_anomaly:
         torch.autograd.set_detect_anomaly(True)
 
+    EVAL_PATH = Path(args.save_dir, "eval")
+
     optimizer_fn = {
         "sgd": torch.optim.SGD,
         "adam": torch.optim.Adam,
@@ -316,6 +333,12 @@ def training(rank, conf, output_dir, args):
         params = filter_parameters(params, conf.train.opt_regexp)
     all_params = [p for n, p in params]
 
+    default_batch_size = 32
+    lr_old = conf.train.lr
+    conf.train.lr = conf.train.lr * conf.data.batch_size / default_batch_size
+    if args.lr_scale:
+        conf.train.lr *= args.lr_scale
+    logger.info(f'change lr from {lr_old} to {conf.train.lr}')
     lr_params = pack_lr_parameters(params, conf.train.lr, conf.train.lr_scaling)
     optimizer = optimizer_fn(
         lr_params, lr=conf.train.lr, **conf.train.optimizer_options
@@ -365,9 +388,9 @@ def training(rank, conf, output_dir, args):
 
         # we first run the eval
         if (
-            rank == 0
-            and epoch % conf.train.test_every_epoch == 0
-            and args.run_benchmarks
+                rank == 0
+                and epoch % conf.train.test_every_epoch == 0
+                and args.run_benchmarks
         ):
             for bname, eval_conf in conf.get("benchmarks", {}).items():
                 logger.info(f"Running eval on {bname}")
@@ -408,7 +431,10 @@ def training(rank, conf, output_dir, args):
                     getattr(loader.dataset, conf.train.dataset_callback_fn)(
                         conf.train.seed + epoch
                     )
-        for it, data in enumerate(train_loader):
+        for it, data in tqdm(enumerate(train_loader), total=len(train_loader),
+                             desc="Training Progress") if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0 else enumerate(
+            train_loader):
+
             tot_it = (len(train_loader) * epoch + it) * (
                 args.n_gpus if args.distributed else 1
             )
@@ -469,7 +495,6 @@ def training(rank, conf, output_dir, args):
             else:
                 if rank == 0:
                     logger.warning(f"Skip iteration {it} due to detach.")
-
             if args.profile:
                 prof.step()
 
@@ -512,12 +537,12 @@ def training(rank, conf, output_dir, args):
 
             # Run validation
             if (
-                (
-                    it % conf.train.eval_every_iter == 0
-                    and (it > 0 or epoch == -int(args.no_eval_0))
-                )
-                or stop
-                or it == (len(train_loader) - 1)
+                    (
+                            it % conf.train.eval_every_iter == 0
+                            and (it > 0 or epoch == -int(args.no_eval_0))
+                    )
+                    or stop
+                    or it == (len(train_loader) - 1)
             ):
                 with fork_rng(seed=conf.train.seed):
                     results, pr_metrics, figures = do_evaluation(
@@ -595,7 +620,6 @@ def training(rank, conf, output_dir, args):
                     stop,
                     args.distributed,
                 )
-
             if stop:
                 break
 
@@ -632,7 +656,7 @@ def main_worker(rank, conf, output_dir, args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("experiment", type=str)
+    parser.add_argument("--experiment", type=str)
     parser.add_argument("--conf", type=str)
     parser.add_argument(
         "--mixed_precision",
@@ -656,11 +680,16 @@ if __name__ == "__main__":
     parser.add_argument("--log_it", "--log_it", action="store_true")
     parser.add_argument("--no_eval_0", action="store_true")
     parser.add_argument("--run_benchmarks", action="store_true")
+    parser.add_argument('--save_dir', type=str)
+    parser.add_argument('--lr_scale', type=float, default=1.0)
+    parser.add_argument('--modality_list', nargs='+', default=['visible'])
+    parser.add_argument('--ckpt_path', type=str, default=None)
+
     parser.add_argument("dotlist", nargs="*")
     args = parser.parse_intermixed_args()
 
     logger.info(f"Starting experiment {args.experiment}")
-    output_dir = Path(TRAINING_PATH, args.experiment)
+    output_dir = Path(args.save_dir, args.experiment)
     output_dir.mkdir(exist_ok=True, parents=True)
 
     conf = OmegaConf.from_cli(args.dotlist)
@@ -671,7 +700,7 @@ if __name__ == "__main__":
         conf = OmegaConf.merge(restore_conf, conf)
     if not args.restore:
         if conf.train.seed is None:
-            conf.train.seed = torch.initial_seed() & (2**32 - 1)
+            conf.train.seed = torch.initial_seed() & (2 ** 32 - 1)
         OmegaConf.save(conf, str(output_dir / "config.yaml"))
 
     # copy gluefactory and submodule into output dir

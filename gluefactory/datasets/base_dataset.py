@@ -61,9 +61,9 @@ def collate(batch):
                 storage = elem.storage()._new_shared(numel)  # noqa: F841
         return torch.stack(batch, dim=0)
     elif (
-        elem_type.__module__ == "numpy"
-        and elem_type.__name__ != "str_"
-        and elem_type.__name__ != "string_"
+            elem_type.__module__ == "numpy"
+            and elem_type.__name__ != "str_"
+            and elem_type.__name__ != "string_"
     ):
         if elem_type.__name__ == "ndarray" or elem_type.__name__ == "memmap":
             # array of string classes and object
@@ -128,7 +128,11 @@ class BaseDataset(metaclass=ABCMeta):
     }
     default_conf = {}
 
-    def __init__(self, conf):
+    def __init__(self, conf, modality_list=None):
+        if modality_list is None:
+            self.modality_list = ['visible']
+        else:
+            self.modality_list = modality_list
         """Perform some logic and call the _init method of the child model."""
         default_conf = OmegaConf.merge(
             OmegaConf.create(self.base_default_conf),
@@ -148,14 +152,14 @@ class BaseDataset(metaclass=ABCMeta):
         raise NotImplementedError
 
     @abstractmethod
-    def get_dataset(self, split):
+    def get_dataset(self, split, modality_list=None):
         """To be implemented by the child class."""
         raise NotImplementedError
 
     def get_data_loader(self, split, shuffle=None, pinned=False, distributed=False):
         """Return a data loader for a given split."""
         assert split in ["train", "val", "test"]
-        dataset = self.get_dataset(split)
+        dataset = self.get_dataset(split,modality_list=self.modality_list)
         try:
             batch_size = self.conf[split + "_batch_size"]
         except omegaconf.MissingMandatoryValue:

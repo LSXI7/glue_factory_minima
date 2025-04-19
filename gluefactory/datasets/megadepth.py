@@ -1,25 +1,25 @@
 import argparse
 import logging
-import shutil
-import tarfile
+import random
+import time
 from collections.abc import Iterable
 from pathlib import Path
 
+import PIL.Image
 import h5py
 import matplotlib.pyplot as plt
 import numpy as np
-import PIL.Image
 import torch
 from omegaconf import OmegaConf
 
+from .base_dataset import BaseDataset
+from .utils import rotate_intrinsics, rotate_pose_inplane, scale_intrinsics
 from ..geometry.wrappers import Camera, Pose
 from ..models.cache_loader import CacheLoader
 from ..settings import DATA_PATH
 from ..utils.image import ImagePreprocessor, load_image
 from ..utils.tools import fork_rng
 from ..visualization.viz2d import plot_heatmaps, plot_image_grid
-from .base_dataset import BaseDataset
-from .utils import rotate_intrinsics, rotate_pose_inplane, scale_intrinsics
 
 logger = logging.getLogger(__name__)
 scene_lists_path = Path(__file__).parent / "megadepth_scene_lists"
@@ -37,9 +37,9 @@ class MegaDepth(BaseDataset):
     default_conf = {
         # paths
         "data_dir": "megadepth/",
-        "depth_subpath": "depth_undistorted/",
-        "image_subpath": "Undistorted_SfM/",
-        "info_dir": "scene_info/",  # @TODO: intrinsics problem?
+        "depth_subpath": "phoenix/S6/zl548/MegaDepth_v1/",
+        "image_subpath": "phoenix/S6/zl548/MegaDepth_v1/",
+        "info_dir": "scene_info_no_sfm/",  # @TODO: intrinsics problem?
         # Training
         "train_split": "train_scenes_clean.txt",
         "train_num_per_scene": 500,
@@ -75,44 +75,45 @@ class MegaDepth(BaseDataset):
     }
 
     def _init(self, conf):
-        if not (DATA_PATH / conf.data_dir).exists():
-            logger.info("Downloading the MegaDepth dataset.")
-            self.download()
 
-    def download(self):
-        data_dir = DATA_PATH / self.conf.data_dir
-        tmp_dir = data_dir.parent / "megadepth_tmp"
-        if tmp_dir.exists():  # The previous download failed.
-            shutil.rmtree(tmp_dir)
-        tmp_dir.mkdir(exist_ok=True, parents=True)
-        url_base = "https://cvg-data.inf.ethz.ch/megadepth/"
-        for tar_name, out_name in (
-            ("Undistorted_SfM.tar.gz", self.conf.image_subpath),
-            ("depth_undistorted.tar.gz", self.conf.depth_subpath),
-            ("scene_info.tar.gz", self.conf.info_dir),
-        ):
-            tar_path = tmp_dir / tar_name
-            torch.hub.download_url_to_file(url_base + tar_name, tar_path)
-            with tarfile.open(tar_path) as tar:
-                tar.extractall(path=tmp_dir)
-            tar_path.unlink()
-            shutil.move(tmp_dir / tar_name.split(".")[0], tmp_dir / out_name)
-        shutil.move(tmp_dir, data_dir)
+        a = 1
 
-    def get_dataset(self, split):
+    def get_dataset(self, split,modality_list=None):
         assert self.conf.views in [1, 2, 3]
         if self.conf.views == 3:
             return _TripletDataset(self.conf, split)
         else:
-            return _PairDataset(self.conf, split)
+            return _PairDataset(self.conf, split, modality_list=modality_list)
 
 
 class _PairDataset(torch.utils.data.Dataset):
-    def __init__(self, conf, split, load_sample=True):
-        self.root = DATA_PATH / conf.data_dir
+    def __init__(self, conf, split, load_sample=True,modality_list=None):
+        self.modality_list= modality_list
+        if self.modality_list is None:
+            self.modal_options = ['visible']
+        else:
+            self.modal_options = modality_list
+        self.root = DATA_PATH / conf.data_dir  # data/megadepth
+        self.infrared_root = DATA_PATH / conf.data_dir / "infrared/"
+        self.depth_root = DATA_PATH / conf.data_dir / "depth/"
+        self.normal_root = DATA_PATH / conf.data_dir / "normal/"
+        self.event_root = DATA_PATH / conf.data_dir / "event/"
+        self.paint_root = DATA_PATH / conf.data_dir / "paint/"
+        self.sketch_root = DATA_PATH / conf.data_dir / "sketch/"
         assert self.root.exists(), self.root
         self.split = split
         self.conf = conf
+        self.modality_to_root = {
+            'visible': self.root,
+            'infrared': self.infrared_root,
+            'depth': self.depth_root,
+            'normal': self.normal_root,
+            'event': self.event_root,
+            'sketch': self.sketch_root,
+            'paint': self.paint_root,
+        }
+        self.local_random_1 = random.Random(time.time())
+        self.local_random_2 = random.Random(time.time() + 666)
 
         split_conf = conf[split + "_split"]
         if isinstance(split_conf, (str, Path)):
@@ -188,7 +189,7 @@ class _PairDataset(torch.utils.data.Dataset):
                 if scene not in self.images:
                     continue
                 valid = (self.images[scene] != None) | (  # noqa: E711
-                    self.depths[scene] != None  # noqa: E711
+                        self.depths[scene] != None  # noqa: E711
                 )
                 ids = np.where(valid)[0]
                 if num_pos and len(ids) > num_pos:
@@ -199,11 +200,11 @@ class _PairDataset(torch.utils.data.Dataset):
                 self.items.extend(ids)
         else:
             for scene in self.scenes:
-                path = self.info_dir / (scene + ".npz")
+                path = self.info_dir / (scene + ".npz")  # data/megadepth/scene_info/scene.npz
                 assert path.exists(), path
                 info = np.load(str(path), allow_pickle=True)
                 valid = (self.images[scene] != None) & (  # noqa: E711
-                    self.depths[scene] != None  # noqa: E711
+                        self.depths[scene] != None  # noqa: E711
                 )
                 ind = np.where(valid)[0]
                 mat = info["overlap_matrix"][valid][:, valid]
@@ -213,8 +214,8 @@ class _PairDataset(torch.utils.data.Dataset):
                     num_bins = self.conf.num_overlap_bins
                     assert num_bins > 0
                     bin_width = (
-                        self.conf.max_overlap - self.conf.min_overlap
-                    ) / num_bins
+                                        self.conf.max_overlap - self.conf.min_overlap
+                                ) / num_bins
                     num_per_bin = num_pos // num_bins
                     pairs_all = []
                     for k in range(num_bins):
@@ -233,7 +234,7 @@ class _PairDataset(torch.utils.data.Dataset):
                     pairs = np.concatenate(pairs, 0)
                 else:
                     pairs = (mat > self.conf.min_overlap) & (
-                        mat <= self.conf.max_overlap
+                            mat <= self.conf.max_overlap
                     )
                     pairs = np.stack(np.where(pairs), -1)
 
@@ -255,7 +256,6 @@ class _PairDataset(torch.utils.data.Dataset):
         K = self.intrinsics[scene][idx].astype(np.float32, copy=False)
         T = self.poses[scene][idx].astype(np.float32, copy=False)
 
-        # read image
         if self.conf.read_image:
             img = load_image(self.root / self.images[scene][idx], self.conf.grayscale)
         else:
@@ -266,9 +266,10 @@ class _PairDataset(torch.utils.data.Dataset):
 
         # read depth
         if self.conf.read_depth:
+
             depth_path = (
-                self.root / self.conf.depth_subpath / scene / (path.stem + ".h5")
-            )
+                    self.root / self.depths[scene][idx])
+            assert depth_path.exists(), depth_path
             with h5py.File(str(depth_path), "r") as f:
                 depth = f["/depth"].__array__().astype(np.float32, copy=False)
                 depth = torch.Tensor(depth)[None]
@@ -288,8 +289,9 @@ class _PairDataset(torch.utils.data.Dataset):
                     depth = np.rot90(depth, k=-k, axes=(-2, -1)).copy()
                 K = rotate_intrinsics(K, img.shape, k + 2)
                 T = rotate_pose_inplane(T, k + 2)
-
+        prefix = 'visible_'
         name = path.name
+        name = prefix + name
 
         data = self.preprocessor(img)
         if depth is not None:
@@ -297,7 +299,96 @@ class _PairDataset(torch.utils.data.Dataset):
                 0
             ]
         K = scale_intrinsics(K, data["scales"])
+        data = {
+            "name": name,
+            "scene": scene,
+            "T_w2cam": Pose.from_4x4mat(T),
+            "depth": depth,
+            "camera": Camera.from_calibration_matrix(K).float(),
+            **data,
+        }
 
+        if self.conf.load_features.do:
+            features = self.feature_loader({k: [v] for k, v in data.items()})
+            if do_rotate and k != 0:
+                # ang = np.deg2rad(k * 90.)
+                kpts = features["keypoints"].copy()
+                x, y = kpts[:, 0].copy(), kpts[:, 1].copy()
+                w, h = data["image_size"]
+                if k == 1:
+                    kpts[:, 0] = w - y
+                    kpts[:, 1] = x
+                elif k == -1:
+                    kpts[:, 0] = y
+                    kpts[:, 1] = h - x
+
+                else:
+                    raise ValueError
+                features["keypoints"] = kpts
+
+            data = {"cache": features, **data}
+        return data
+
+    def _read_view2(self, scene, idx, png=False):
+        path = self.multi_model_root / self.images[scene][idx]
+
+        # read pose data
+        K = self.intrinsics[scene][idx].astype(np.float32, copy=False)
+        T = self.poses[scene][idx].astype(np.float32, copy=False)
+
+        # read image
+        if self.conf.read_image:
+            if png:
+                name = self.images[scene][idx].replace('jpg', 'png')
+            else:
+                name = self.images[scene][idx].replace('png', 'jpg')
+
+            img = load_image(self.multi_model_root / name, self.conf.grayscale)
+
+
+        else:
+            size = PIL.Image.open(path).size[::-1]
+            img = torch.zeros(
+                [3 - 2 * int(self.conf.grayscale), size[0], size[1]]
+            ).float()
+
+        # read depth
+        if self.conf.read_depth:
+            depth_path = (
+                    self.root / self.depths[scene][idx])
+            assert depth_path.exists(), depth_path
+            with h5py.File(str(depth_path), "r") as f:
+                depth = f["/depth"].__array__().astype(np.float32, copy=False)
+                depth = torch.Tensor(depth)[None]
+            assert depth.shape[-2:] == img.shape[-2:]
+        else:
+            depth = None
+
+        # add random rotations
+        do_rotate = self.conf.p_rotate > 0.0 and self.split == "train"
+        if do_rotate:
+            p = self.conf.p_rotate
+            k = 0
+            if np.random.rand() < p:
+                k = np.random.choice(2, 1, replace=False)[0] * 2 - 1
+                img = np.rot90(img, k=-k, axes=(-2, -1))
+                if self.conf.read_depth:
+                    depth = np.rot90(depth, k=-k, axes=(-2, -1)).copy()
+                K = rotate_intrinsics(K, img.shape, k + 2)
+                T = rotate_pose_inplane(T, k + 2)
+        prefix = self.multi_model + '_'
+        if png:
+            name = path.name.replace(".jpg", ".png")
+        else:
+            name = path.name.replace(".png", ".jpg")
+        name = prefix + name
+
+        data = self.preprocessor(img)
+        if depth is not None:
+            data["depth"] = self.preprocessor(depth, interpolation="nearest")["image"][
+                0
+            ]
+        K = scale_intrinsics(K, data["scales"])
         data = {
             "name": name,
             "scene": scene,
@@ -336,13 +427,46 @@ class _PairDataset(torch.utils.data.Dataset):
             return self.getitem(idx)
 
     def getitem(self, idx):
+        reverse_mode = self.local_random_1.randint(0, 1)  # 0: visible-infrared, 1: infrared-visible
+        self.multi_model = self.local_random_2.choice(self.modal_options)
+        self.multi_model = str(self.multi_model).strip().strip('"').strip("'")
+        try:
+            self.multi_model_root = self.modality_to_root[self.multi_model]
+        except KeyError:
+            raise ValueError(f"Unknown multi_model: {self.multi_model}")
         if self.conf.views == 2:
+            idx = idx // 2
             if isinstance(idx, list):
                 scene, idx0, idx1, overlap = idx
             else:
                 scene, idx0, idx1, overlap = self.items[idx]
-            data0 = self._read_view(scene, idx0)
-            data1 = self._read_view(scene, idx1)
+
+            print('multi_model:', self.multi_model, 'reverse_mode:', reverse_mode)
+            if reverse_mode:
+                if self.multi_model in ['infrared', 'depth', 'normal', 'paint', 'sketch']:
+                    data0 = self._read_view(scene, idx0)
+                    data1 = self._read_view2(scene, idx1, png=False)
+                elif self.multi_model in ['event']:
+                    data0 = self._read_view(scene, idx0)
+                    data1 = self._read_view2(scene, idx1, png=True)
+                elif self.multi_model == 'visible':
+                    data0 = self._read_view(scene, idx0)
+                    data1 = self._read_view(scene, idx1)
+                else:
+                    raise ValueError(f"Unknown multi_model: {self.multi_model}")
+            else:
+                if self.multi_model in ['infrared', 'depth', 'normal', 'paint', 'sketch']:
+                    data0 = self._read_view2(scene, idx0, png=False)
+                    data1 = self._read_view(scene, idx1)
+                elif self.multi_model in ['event']:
+                    data0 = self._read_view2(scene, idx0, png=True)
+                    data1 = self._read_view(scene, idx1)
+                elif self.multi_model == 'visible':
+                    data0 = self._read_view(scene, idx0)
+                    data1 = self._read_view(scene, idx1)
+                else:
+                    raise ValueError(f"Unknown multi_model: {self.multi_model}")
+
             data = {
                 "view0": data0,
                 "view1": data1,
@@ -353,14 +477,51 @@ class _PairDataset(torch.utils.data.Dataset):
             data["name"] = f"{scene}/{data0['name']}_{data1['name']}"
         else:
             assert self.conf.views == 1
+            original_idx = idx
+            idx = original_idx // 7
             scene, idx0 = self.items[idx]
-            data = self._read_view(scene, idx0)
+            if original_idx % 7 == 0:
+                self.multi_model = 'visible'
+                data = self._read_view(scene, idx0)
+            elif original_idx % 7 == 1:
+                self.multi_model = 'infrared'
+                data = self._read_view2(scene, idx0, png=False)
+            elif original_idx % 7 == 2:
+                self.multi_model = 'depth'
+                self.multi_model_root = self.depth_root
+                data = self._read_view2(scene, idx0, png=False)
+            elif original_idx % 7 == 3:
+                self.multi_model = 'normal'
+                self.multi_model_root = self.normal_root
+                data = self._read_view2(scene, idx0, png=False)
+            elif original_idx % 7 == 4:
+                self.multi_model = 'event'
+                self.multi_model_root = self.event_root
+                data = self._read_view2(scene, idx0, png=True)
+            elif original_idx % 7 == 5:
+                self.multi_model = 'paint'
+                self.multi_model_root = self.paint_root
+                data = self._read_view2(scene, idx0, png=False)
+            elif original_idx % 7 == 6:
+                self.multi_model = 'sketch'
+                self.multi_model_root = self.sketch_root
+                data = self._read_view2(scene, idx0, png=False)
+            else:
+                raise ValueError
         data["scene"] = scene
         data["idx"] = idx
         return data
 
     def __len__(self):
-        return len(self.items)
+        if self.conf.views == 2 and self.modal_options != ['visible']:
+            return len(self.items) * 2
+        elif self.conf.views == 2 and self.modal_options == ['visible']:
+            return len(self.items)
+        elif self.conf.views == 1:
+            nums = len(self.modal_options)
+            return len(self.items) * nums
+        else:
+            raise ValueError(f"Unknown number of views: {self.conf.views}.")
 
 
 class _TripletDataset(_PairDataset):
@@ -390,7 +551,7 @@ class _TripletDataset(_PairDataset):
                 if self.conf.num_overlap_bins > 1:
                     raise NotImplementedError("TODO")
                 valid = (self.images[scene] != None) & (  # noqa: E711
-                    self.depth[scene] != None  # noqa: E711
+                        self.depth[scene] != None  # noqa: E711
                 )
                 ind = np.where(valid)[0]
                 mat = info["overlap_matrix"][valid][:, valid]
